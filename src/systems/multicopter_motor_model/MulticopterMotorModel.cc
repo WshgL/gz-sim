@@ -560,6 +560,18 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
     }
     default:  // MotorType::kVelocity
     {
+      // Apply the filter on the motor's velocity.
+      double refMotorRotVel;
+      refMotorRotVel = this->rotorVelocityFilter->UpdateFilter(
+          this->refMotorInput, this->samplingTime);
+
+      const auto jointVelCmd = _ecm.Component<components::JointVelocityCmd>(
+          this->jointEntity);
+      *jointVelCmd = components::JointVelocityCmd(
+          {this->turningDirection * refMotorRotVel
+                              / this->rotorVelocitySlowdownSim});
+
+      // Get the motor rotation speed.
       const auto jointVelocity = _ecm.Component<components::JointVelocity>(
           this->jointEntity);
       double motorRotVel = jointVelocity->Data()[0];
@@ -571,6 +583,7 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       }
       double realMotorVelocity =
           motorRotVel * this->rotorVelocitySlowdownSim;
+
       // Get the direction of the rotor rotation.
       int realMotorVelocitySign =
           (realMotorVelocity > 0) - (realMotorVelocity < 0);
@@ -677,16 +690,6 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
         msgs::Set(parentWrenchComp->Data().mutable_torque(),
           msgs::Convert(parentWrenchComp->Data().torque()) + parentWorldTorque);
       }
-      // Apply the filter on the motor's velocity.
-      double refMotorRotVel;
-      refMotorRotVel = this->rotorVelocityFilter->UpdateFilter(
-          this->refMotorInput, this->samplingTime);
-
-      const auto jointVelCmd = _ecm.Component<components::JointVelocityCmd>(
-          this->jointEntity);
-      *jointVelCmd = components::JointVelocityCmd(
-          {this->turningDirection * refMotorRotVel
-                              / this->rotorVelocitySlowdownSim});
     }
   }
 }
