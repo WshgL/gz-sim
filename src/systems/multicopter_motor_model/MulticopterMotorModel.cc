@@ -28,6 +28,7 @@
 #include <string>
 
 #include <gz/msgs/actuators.pb.h>
+#include <gz/msgs/double.pb.h>
 
 #include <gz/common/Profiler.hh>
 
@@ -151,6 +152,9 @@ class gz::sim::systems::MulticopterMotorModelPrivate
   /// \brief Topic for actuator commands.
   public: std::string commandSubTopic;
 
+  /// \brief Topic for motor rotation speed.
+  public: std::string motorSpeedPubTopic;
+
   /// \brief Topic namespace.
   public: std::string robotNamespace;
 
@@ -220,6 +224,9 @@ class gz::sim::systems::MulticopterMotorModelPrivate
 
   /// \brief Gazebo communication node.
   public: transport::Node node;
+
+  /// \brief Publisher for motor speed
+  public: transport::Node::Publisher msPub;
 };
 
 //////////////////////////////////////////////////
@@ -346,6 +353,9 @@ void MulticopterMotorModel::Configure(const Entity &_entity,
   sdfClone->Get<std::string>("commandSubTopic",
       this->dataPtr->commandSubTopic, this->dataPtr->commandSubTopic);
 
+  sdfClone->Get<std::string>("motorSpeedPubTopic",
+      this->dataPtr->motorSpeedPubTopic, this->dataPtr->motorSpeedPubTopic);
+
   sdfClone->Get<double>("rotorDragCoefficient",
       this->dataPtr->rotorDragCoefficient,
       this->dataPtr->rotorDragCoefficient);
@@ -373,9 +383,9 @@ void MulticopterMotorModel::Configure(const Entity &_entity,
           this->dataPtr->refMotorInput);
 
   // Subscribe to actuator command messages
-  std::string topic = transport::TopicUtils::AsValidTopic(
+  std::string topic_sub = transport::TopicUtils::AsValidTopic(
       this->dataPtr->robotNamespace + "/" + this->dataPtr->commandSubTopic);
-  if (topic.empty())
+  if (topic_sub.empty())
   {
     gzerr << "Failed to create topic for [" << this->dataPtr->robotNamespace
            << "]" << std::endl;
@@ -383,10 +393,25 @@ void MulticopterMotorModel::Configure(const Entity &_entity,
   }
   else
   {
-    gzdbg << "Listening to topic: " << topic << std::endl;
+    gzdbg << "Listening to topic: " << topic_sub << std::endl;
   }
-  this->dataPtr->node.Subscribe(topic,
+  this->dataPtr->node.Subscribe(topic_sub,
       &MulticopterMotorModelPrivate::OnActuatorMsg, this->dataPtr.get());
+
+  // Publisher of motor rotation speed
+  std::string topic_pub;
+  if (!this->dataPtr->motorSpeedPubTopic.empty())
+  {
+    topic_pub = transport::TopicUtils::AsValidTopic(
+        this->dataPtr->robotNamespace + "/" + this->dataPtr->motorSpeedPubTopic);
+  }
+  else
+  {
+    topic_pub = transport::TopicUtils::AsValidTopic(
+        this->dataPtr->robotNamespace + "/motor_speed/" + std::to_string(this->dataPtr->actuatorNumber));
+  }
+  this->dataPtr->msPub =
+      this->dataPtr->node.Advertise<gz::msgs::Double>(topic_pub);
 }
 
 //////////////////////////////////////////////////
@@ -583,6 +608,11 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       }
       double realMotorVelocity =
           motorRotVel * this->rotorVelocitySlowdownSim;
+
+      // Publish the motor speed
+      gz::msgs::Double msMsg;
+      msMsg.set_data(realMotorVelocity);
+      this->msPub.Publish(msMsg);
 
       // Get the direction of the rotor rotation.
       int realMotorVelocitySign =
