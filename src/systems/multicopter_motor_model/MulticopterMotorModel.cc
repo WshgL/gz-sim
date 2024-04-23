@@ -120,10 +120,20 @@ enum class MotorType {
   kForce
 };
 
+/// \brief Type of fault.
+enum class FaultType {
+  kMotor,
+  kPropeller,
+  kNone
+};
+
 class gz::sim::systems::MulticopterMotorModelPrivate
 {
   /// \brief Callback for actuator commands.
   public: void OnActuatorMsg(const msgs::Actuators &_msg);
+
+  /// \brief Callback for fault message.
+  public: void OnFaultMsg(const msgs::Actuators &_msg);
 
   /// \brief Apply link forces and moments based on propeller state.
   public: void UpdateForcesAndMoments(EntityComponentManager &_ecm);
@@ -148,6 +158,12 @@ class gz::sim::systems::MulticopterMotorModelPrivate
 
   /// \brief Model interface
   public: Model model{kNullEntity};
+
+  /// \brief Enable fault injection.
+  public: bool enableFault = false;
+
+  /// \brief Topic for fault injection.
+  public: std::string faultSubTopic;
 
   /// \brief Topic for actuator commands.
   public: std::string commandSubTopic;
@@ -222,11 +238,23 @@ class gz::sim::systems::MulticopterMotorModelPrivate
   /// \brief Mutex to protect recvdActuatorsMsg.
   public: std::mutex recvdActuatorsMsgMutex;
 
+  /// \brief Type of fault.
+  public: FaultType faultType = FaultType::kNone;
+
+  /// \brief Fault value, loss of efficiency, 0 ~ no fault, 1 ~ complete fault
+  public: float faultValue = 0.0;
+
+  /// \brief Received Faults message.
+  public: std::optional<msgs::Actuators> recvdFaultMsg;
+
+  /// \brief Mutex to protect recvdFaultMsg.
+  public: std::mutex recvdFaultMsgMutex;
+
   /// \brief Gazebo communication node.
   public: transport::Node node;
 
   /// \brief Publisher for motor speed
-  public: transport::Node::Publisher msPub;
+  public: transport::Node::Publisher mspPub;
 };
 
 //////////////////////////////////////////////////
@@ -376,16 +404,66 @@ void MulticopterMotorModel::Configure(const Entity &_entity,
   sdfClone->Get<double>("rotorVelocitySlowdownSim",
       this->dataPtr->rotorVelocitySlowdownSim, 10);
 
+  sdfClone->Get<bool>("enableFault",
+      this->dataPtr->enableFault, false);
+  sdfClone->Get<std::string>("faultSubTopic",
+      this->dataPtr->faultSubTopic, this->dataPtr->faultSubTopic);
+
+  if (sdfClone->HasElement("faultType"))
+  {
+    auto faultType = sdfClone->GetElement("faultType")->Get<std::string>();
+
+    if (faultType == "motor")
+    {
+      this->dataPtr->faultType = FaultType::kMotor;
+    }
+    else if (faultType == "propeller")
+    {
+      this->dataPtr->faultType = FaultType::kPropeller;
+    }
+    else
+    {
+      this->dataPtr->faultType = FaultType::kNone;
+    }
+  }
+  else
+  {
+    this->dataPtr->faultType = FaultType::kNone;
+  }
+
   // Create the first order filter.
   this->dataPtr->rotorVelocityFilter =
       std::make_unique<FirstOrderFilter<double>>(
           this->dataPtr->timeConstantUp, this->dataPtr->timeConstantDown,
           this->dataPtr->refMotorInput);
 
+  // Subscribe to fault messages
+  if (this->dataPtr->enableFault)
+  {
+    if (this->dataPtr->faultSubTopic.empty())
+    {
+      this->dataPtr->enableFault = false;
+    }
+    else
+    {
+      std::string faultSub = transport::TopicUtils::AsValidTopic(
+          this->dataPtr->robotNamespace + "/" + this->dataPtr->faultSubTopic);
+      if (faultSub.empty())
+      {
+        this->dataPtr->enableFault = false;
+      }
+      else
+      {
+        this->dataPtr->node.Subscribe(faultSub,
+            &MulticopterMotorModelPrivate::OnFaultMsg, this->dataPtr.get());
+      }
+    }
+  }
+
   // Subscribe to actuator command messages
-  std::string topic_sub = transport::TopicUtils::AsValidTopic(
+  std::string topicSub = transport::TopicUtils::AsValidTopic(
       this->dataPtr->robotNamespace + "/" + this->dataPtr->commandSubTopic);
-  if (topic_sub.empty())
+  if (topicSub.empty())
   {
     gzerr << "Failed to create topic for [" << this->dataPtr->robotNamespace
            << "]" << std::endl;
@@ -393,25 +471,25 @@ void MulticopterMotorModel::Configure(const Entity &_entity,
   }
   else
   {
-    gzdbg << "Listening to topic: " << topic_sub << std::endl;
+    gzdbg << "Listening to topic: " << topicSub << std::endl;
   }
-  this->dataPtr->node.Subscribe(topic_sub,
+  this->dataPtr->node.Subscribe(topicSub,
       &MulticopterMotorModelPrivate::OnActuatorMsg, this->dataPtr.get());
 
   // Publisher of motor rotation speed
-  std::string topic_pub;
+  std::string topicPub;
   if (!this->dataPtr->motorSpeedPubTopic.empty())
   {
-    topic_pub = transport::TopicUtils::AsValidTopic(
+    topicPub = transport::TopicUtils::AsValidTopic(
         this->dataPtr->robotNamespace + "/" + this->dataPtr->motorSpeedPubTopic);
   }
   else
   {
-    topic_pub = transport::TopicUtils::AsValidTopic(
+    topicPub = transport::TopicUtils::AsValidTopic(
         this->dataPtr->robotNamespace + "/motor_speed/" + std::to_string(this->dataPtr->actuatorNumber));
   }
-  this->dataPtr->msPub =
-      this->dataPtr->node.Advertise<gz::msgs::Double>(topic_pub);
+  this->dataPtr->mspPub =
+      this->dataPtr->node.Advertise<gz::msgs::Double>(topicPub);
 }
 
 //////////////////////////////////////////////////
@@ -521,12 +599,53 @@ void MulticopterMotorModelPrivate::OnActuatorMsg(
 }
 
 //////////////////////////////////////////////////
+void MulticopterMotorModelPrivate::OnFaultMsg(
+    const msgs::Actuators &_msg)
+{
+  std::lock_guard<std::mutex> lock(this->recvdFaultMsgMutex);
+  this->recvdFaultMsg = _msg;
+}
+
+//////////////////////////////////////////////////
 void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
     EntityComponentManager &_ecm)
 {
   GZ_PROFILE("MulticopterMotorModelPrivate::UpdateForcesAndMoments");
 
-  std::optional<msgs::Actuators> msg;
+  if (this->enableFault)
+  {
+    std::optional<msgs::Actuators> faultMsg;
+    {
+      std::lock_guard<std::mutex> lock(this->recvdFaultMsgMutex);
+      if (this->recvdFaultMsg.has_value())
+      {
+        faultMsg = *this->recvdFaultMsg;
+        this->recvdFaultMsg.reset();
+      }
+    }
+
+    if (faultMsg.has_value())
+    {
+      if (this->actuatorNumber > faultMsg->normalized_size() - 1)
+      {
+        this->faultValue = 0.0;
+      }
+      else
+      {
+        this->faultValue = faultMsg->normalized(this->actuatorNumber);
+      }
+    }
+    else
+    {
+      this->faultValue = 0.0;
+    }
+  }
+  else
+  {
+    this->faultValue = 0.0;
+  }
+
+  std::optional<msgs::Actuators> actrMsg;
   auto actuatorMsgComp =
       _ecm.Component<components::Actuators>(this->model.Entity());
 
@@ -534,38 +653,44 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
   // component is available, it takes precedence.
   if (actuatorMsgComp)
   {
-    msg = actuatorMsgComp->Data();
+    actrMsg = actuatorMsgComp->Data();
   }
   else
   {
     std::lock_guard<std::mutex> lock(this->recvdActuatorsMsgMutex);
     if (this->recvdActuatorsMsg.has_value())
     {
-      msg = *this->recvdActuatorsMsg;
+      actrMsg = *this->recvdActuatorsMsg;
       this->recvdActuatorsMsg.reset();
     }
   }
 
-  if (msg.has_value())
+  if (actrMsg.has_value())
   {
-    if (this->actuatorNumber > msg->velocity_size() - 1)
+    if (this->actuatorNumber > actrMsg->velocity_size() - 1)
     {
       gzerr << "You tried to access index " << this->actuatorNumber
         << " of the Actuator velocity array which is of size "
-        << msg->velocity_size() << std::endl;
+        << actrMsg->velocity_size() << std::endl;
       return;
     }
 
     if (this->motorType == MotorType::kVelocity)
     {
       this->refMotorInput = std::min(
-          static_cast<double>(msg->velocity(this->actuatorNumber)),
+          static_cast<double>(actrMsg->velocity(this->actuatorNumber)),
           static_cast<double>(this->maxRotVelocity));
     }
     //  else if (this->motorType == MotorType::kPosition)
     else  // if (this->motorType == MotorType::kForce) {
     {
-      this->refMotorInput = msg->velocity(this->actuatorNumber);
+      this->refMotorInput = actrMsg->velocity(this->actuatorNumber);
+    }
+
+    // motor fault injection.
+    if (this->enableFault && this->faultType == FaultType::kMotor)
+    {
+      this->refMotorInput = (1.0 - this->faultValue) * this->refMotorInput;
     }
   }
 
@@ -610,9 +735,9 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
           motorRotVel * this->rotorVelocitySlowdownSim;
 
       // Publish the motor speed
-      gz::msgs::Double msMsg;
-      msMsg.set_data(realMotorVelocity);
-      this->msPub.Publish(msMsg);
+      gz::msgs::Double mspMsg;
+      mspMsg.set_data(realMotorVelocity);
+      this->mspPub.Publish(mspMsg);
 
       // Get the direction of the rotor rotation.
       int realMotorVelocitySign =
@@ -621,6 +746,12 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       double thrust = this->turningDirection * realMotorVelocitySign *
                       realMotorVelocity * realMotorVelocity *
                       this->motorConstant;
+
+      // propeller fault injection.
+      if (this->enableFault && this->faultType == FaultType::kPropeller)
+      {
+        thrust = (1.0 - this->faultValue) * thrust;
+      }
 
       using Pose = math::Pose3d;
       using Vector3 = math::Vector3d;
@@ -695,7 +826,7 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       //  * link_->GetWorldCoGPose()
       Pose poseDifference = (*parentWorldPose).Inverse() * (*worldPose);
       Vector3 dragTorque(
-          0, 0, -this->turningDirection * thrust * this->momentConstant);
+          0, 0, -this->turningDirection * thrust * this->momentConstant); // fault has been injected by thrust
       // Transforming the drag torque into the parent frame to handle
       // arbitrary rotor orientations.
       Vector3 dragTorqueParentFrame =
