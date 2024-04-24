@@ -624,25 +624,10 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       }
     }
 
-    if (faultMsg.has_value())
+    if (faultMsg.has_value() && this->actuatorNumber < faultMsg->normalized_size())
     {
-      if (this->actuatorNumber > faultMsg->normalized_size() - 1)
-      {
-        this->faultValue = 0.0;
-      }
-      else
-      {
-        this->faultValue = faultMsg->normalized(this->actuatorNumber);
-      }
+      this->faultValue = faultMsg->normalized(this->actuatorNumber);
     }
-    else
-    {
-      this->faultValue = 0.0;
-    }
-  }
-  else
-  {
-    this->faultValue = 0.0;
   }
 
   std::optional<msgs::Actuators> actrMsg;
