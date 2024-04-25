@@ -791,6 +791,11 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
                                this->rotorDragCoefficient *
                                bodyVelocityPerpendicular;
 
+      if (this->enableFault && this->faultType == FaultType::kPropeller)
+      {
+        airDrag = (1.0 - this->faultValue) * airDrag;
+      }
+
       // Apply air drag to link.
       link.AddWorldForce(_ecm, airDrag);
       // Moments get the parent link, such that the resulting torques can be
@@ -824,6 +829,12 @@ void MulticopterMotorModelPrivate::UpdateForcesAndMoments(
       rollingMoment = -std::abs(realMotorVelocity) *
                        this->rollingMomentCoefficient *
                        bodyVelocityPerpendicular;
+
+      if (this->enableFault && this->faultType == FaultType::kPropeller)
+      {
+        rollingMoment = (1.0 - this->faultValue) * rollingMoment;
+      }
+
       parentWorldTorque += rollingMoment;
       if (!parentWrenchComp)
       {
